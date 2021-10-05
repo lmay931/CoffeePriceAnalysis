@@ -1,0 +1,391 @@
+---
+title: "Predicting coffee prices using Exponential Smoothing and ARIMA"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+In this analysis I will be using exponential smoothing (Holt and Holt-Winters) and ARIMA models to forecast coffee prices. I will be using data from the FRED Fed St.Louis database going back 30 years to 1990. Let's take a look at the data:
+
+```{r}
+library(xts)
+library(TSstudio)
+library(forecast)
+
+coffee_df <- read.csv("/Users/lawrence/Google Drive/DS/Time Series/coffee_prices/PCOFFOTMUSDM.csv")
+coffee_df$DATE<-as.yearmon(coffee_df$DATE)
+
+coffee_xts <- xts(coffee_df$PCOFFOTMUSDM,order.by = coffee_df$DATE)
+ts_info(coffee_xts)
+```
+
+```{r}
+ts_plot(coffee_xts,
+        title = "Coffee Prices in USD cents per pound by year",
+        Ytitle = "USD cents/pound",
+        Xtitle = "Year")
+```
+
+Looking at the graph, we notice a repeating sort of boom-bust behavior, with perhaps a slight upwards trend. Let's take a look what a time-series decompositon can tell us:
+```{r}
+decompose(as.ts(coffee_xts)) %>% plot()
+```
+The time-series reveals a not particularly strong looking trend pattern, with a peak around the late 90s-early 2000s, a trough in the first decade of the 2000s and then another peak around 2011.
+
+Let's start off by fitting a Holt exponential smoothing model. Unlike the AR, MA and ARIMA family of models, exponential smoothing does not rely on the assumption of a stationary process structure which likely is not met in this case. We can therefore start fitting the model without any differencing or log-transformations.
+
+I will use the first 29 years as training data and use this to make predictions for the last 12 months in the series, which is the period from August 2020 to August 2021.
+
+```{r}
+#Fitting a Holt model
+train <- window(coffee_xts,start=min(index(coffee_xts)),end=index(coffee_xts)[368])
+test <- window(coffee_xts,start=index(coffee_xts)[369],end=max(index(coffee_xts)))
+fc_holt <- holt(train, h = 12, initial = "optimal")
+fc_holt$model
+```
+
+```{r}
+accuracy(fc_holt, test)
+```
+```{r}
+test_forecast(coffee_xts, forecast.obj = fc_holt, test = test)
+```
+The model appears to be capturing the upwards tending trend relatively well. Let's confirm that this is not just one-off luck by using an expanding window approach, similar to using cross-validation in other situations, check the model's performance using more than just one test data set. I will be using the expanding window method of training and testing the data as we don't have a huge amount of data points.
+
+```{r pressure, echo=FALSE, fig.cap="A caption", out.width = '100%'}
+knitr::include_graphics("expanding_window.png")
+```
+Credit to Uber for creating this great illustration of how the expanding window works, their blog post has been a great help: https://eng.uber.com/forecasting-introduction/ .
+
+We will be starting with just the first 10 years of data (which seem to be a good representation of the overall data set, not just an upwards trend if we used only say the first five years). We will then use the rolling window approach to forecast the next 12 months.
+
+```{r}
+start <-  min(index(coffee_xts)) #First time-stamp
+end <- index(coffee_xts)[116] #Time stamp after 10 years
+
+# now use those parameters to make a vector of the time steps at which each
+# window will end
+steps <- seq(from = 117, to=length(coffee_xts), by = 12)
+
+# using lapply, iterate the forecasting-and-scoring process over the
+# windows that created
+scores <- lapply(steps, function(x) {
+
+    train <- coffee_xts[1:(x - 1)] 
+    test <- coffee_xts[x:(x+11)]
+
+   
+    model <- holt(train, h = 12, initial = "optimal")
+    fcst <- forecast(model, h = 12)
+    accuracy(fcst, test)
+})
+rmse_holt <- mean(unlist(lapply(scores, '[[', "Test set","RMSE")))
+rmse_holt
+```
+
+When using expanding window validation, the RMSE turns out to be slightly worse than before when just using one test set. This does not come too surprising as this is likely a more realistic estimate of the model's performance under new data.
+
+```{r}
+scores <- lapply(steps, function(x) {
+
+    train <- coffee_xts[1:(x - 1)] 
+    test <- coffee_xts[x:(x+11)]
+    
+    model <- holt(train, h = 12, initial = "optimal")
+    fcst <- forecast(model, h = 12)
+    
+    test_forecast(coffee_xts[1:(x + 11)]  , forecast.obj = fcst, test = test)
+})
+par(mfrow=c(4,6))
+scores
+```
+
+
+Let's try fitting a more complex Holt-Winters model instead:
+
+```{r}
+#Fitting a Holt-Winters model
+train <- window(coffee_xts,start=min(index(coffee_xts)),end=index(coffee_xts)[368])
+test <- window(coffee_xts,start=index(coffee_xts)[369],end=max(index(coffee_xts)))
+
+coffee_hw <- HoltWinters(train)
+coffee_hw
+```
+
+```{r}
+coffee_fc <- forecast(coffee_hw, h = 12)
+accuracy(coffee_fc, test)
+```
+
+```{r}
+test_forecast(actual = coffee_xts,
+              forecast.obj = coffee_fc,
+              test = test)
+```
+
+The simpler Holt model actually appears to be capturing the data better than the more complex Holt Winters model. While the RMSE for the Holt model lies at 21.8 for the test set, for the Holt Winters model it is at 25.8.
+
+Let's see if we can optimise the model parameters to make the model fit better:
+```{r}
+shallow_grid <- ts_grid(as.ts(train),
+                        model = "HoltWinters",
+                        periods = 6,
+                        window_space = 6,
+                        window_test = 12,
+                        hyper_params = list(alpha = seq(0,1,0.1),
+                                            beta = seq(0,1,0.1),
+                                            gamma = seq(0,1,0.1)),
+                        parallel = TRUE,
+                        n.cores = 8)
+shallow_grid$grid_df[1:10,]
+```
+```{r}
+plot_grid(shallow_grid)
+```
+Let's refine the search space a little given this output:
+```{r}
+deep_grid <- ts_grid(as.ts(train),
+                     model = "HoltWinters",
+                     periods = 6,
+                     window_space = 6,
+                     window_test = 12,
+                     hyper_params = list(alpha = seq(0,0.5,0.01),
+                                         beta = seq(0,0.8,0.01),
+                                         gamma = seq(0.1,0.2,0.01)),
+                     parallel = TRUE,
+                     n.cores = 8)
+
+plot_grid(deep_grid)
+```
+
+Let's see how our model perform with the newly tuned parameters:
+```{r}
+coffee_hw_grid <- HoltWinters(train,
+                          alpha = deep_grid$alpha,
+                          beta = deep_grid$beta,
+                          gamma = deep_grid$gamma)
+fc_hw_grid <- forecast(coffee_hw_grid, h = 12)
+accuracy(fc_hw_grid, test)
+```
+
+```{r}
+test_forecast(actual = coffee_xts,
+              forecast.obj = fc_hw_grid,
+              test = test)
+```
+Having optimised the model's parameters brings down the test RMSE to 19.44 - a real improvement! This can be seen visually in the above graph as well, the model appears to be doing a much better job at predicting the future price movement of the coffee price.
+
+Let's see how this model performs on with our expanding window cross-validation. A potential issue to keep in mind here is that the model has seen all the data up until August 2020 already in the model tuning process, therefore there might be an upward bias when using an expanding window. Let's see how it performs anyway:
+```{r}
+
+steps <- seq(from = 117, to=length(coffee_xts), by = 12)
+
+# using lapply, iterate the forecasting-and-scoring process over the
+# windows that created
+scores <- lapply(steps, function(x) {
+
+    train <- coffee_xts[1:(x - 1)] 
+    test <- coffee_xts[x:(x+11)]
+
+   
+    model <- HoltWinters(train,
+                          alpha = deep_grid$alpha,
+                          beta = deep_grid$beta,
+                          gamma = deep_grid$gamma)
+    fcst <- forecast(model, h = 12)
+    accuracy(fcst, test)
+})
+rmse_hw_tuned <- mean(unlist(lapply(scores, '[[', "Test set","RMSE")))
+rmse_hw_tuned
+```
+
+We get a RMSE of 27.53, quite a bit higher than using just the test period of Sep 2020 - Aug 2021 as before. Let's see how the standard, untuned Holt-Winters model performs using the expanding window approach:
+
+```{r}
+scores <- lapply(steps, function(x) {
+
+    train <- coffee_xts[1:(x - 1)] 
+    test <- coffee_xts[x:(x+11)]
+
+   
+    model <- HoltWinters(train)
+    fcst <- forecast(model, h = 12)
+    accuracy(fcst, test)
+})
+rmse_hw <- mean(unlist(lapply(scores, '[[', "Test set","RMSE")))
+rmse_hw
+```
+
+Using the unoptimised, out-of-the-box HoltWinters model instead significantly improves RMSE to 24.56. A classic case of overfitting the model to the training data it seems. SUrprisingly, the simpler Holt model performed even better, with a RMSE of 23.54. Sometimes simpler really is better.
+
+
+
+
+Let's see how an ARIMA model compares to this. I will start off looking at the ACF (Auto-correlation) and PACF(Partial Auto Correlation) graphs:
+```{r}
+train <- window(coffee_xts,start=min(index(coffee_xts)),end=index(coffee_xts)[368])
+test <- window(coffee_xts,start=index(coffee_xts)[369],end=max(index(coffee_xts)))
+#Fitting an ARIMA model
+par(mfrow=c(1,2))
+acf(train, lag.max = 60)
+pacf(train, lag.max = 60)
+```
+
+We can see from the ACF plot that the correlation of the series with its lags is slowly decaying over time in a linear manner. Removing both the series trend and correlation between the series and its lags can be done by differencing the series.
+
+The ACF and PACF plots of the first difference of the series indicate that an AR(1) process
+could be appropriate to use on the differenced series since the ACF is tailing off and the PACF cuts
+on the first lag. We will do another grid-search to determine the optimal parameters for the ARIMA model:
+
+```{r}
+p <- q <- P <- Q <- 0:2
+arima_grid <- expand.grid(p,q,P,Q)
+names(arima_grid) <- c("p", "q", "P", "Q")
+arima_grid$d <- 1
+arima_grid$D <- 1
+arima_grid$k <- rowSums(arima_grid)
+library(dplyr)
+arima_grid <- arima_grid %>% filter(k <= 7)
+
+arima_search <- lapply(1:nrow(arima_grid), function(i){
+  md <- NULL
+  md <- arima(train, order = c(arima_grid$p[i], 1, arima_grid$q[i]),
+              seasonal = list(order = c(arima_grid$P[i], 1, arima_grid$Q[i])))
+  results <- data.frame(p = arima_grid$p[i], d = 1, q = arima_grid$q[i],
+                        P = arima_grid$P[i], D = 1, Q = arima_grid$Q[i],
+                        AIC = md$aic)
+}) %>% bind_rows() %>% arrange(AIC)
+head(arima_search)
+```
+
+Looks like the first few models are quite similar when it comes to their AIC scores. Let's see how they perform under a rolling-window cross validation:
+
+```{r}
+# window will end
+steps <- seq(from = 117, to=length(coffee_xts), by = 12)
+
+# using lapply, iterate the forecasting-and-scoring process over the
+# windows that created
+scores <- lapply(steps, function(x) {
+
+    train <- coffee_xts[1:(x - 1)] 
+    test <- coffee_xts[x:(x+11)]
+
+    model <- arima(train, order = c(arima_search[1,1],arima_search[1,2],arima_search[1,3]),
+                                    seasonal = c(arima_search[1,4],arima_search[1,5],arima_search[1,6]))
+    fcst <- forecast(model, h = 12)
+    accuracy(fcst, test)
+    
+})
+rmse_mod1 <- mean(unlist(lapply(scores, '[[', "Test set","RMSE")))
+rmse_mod1
+```
+
+```{r}
+scores <- lapply(steps, function(x) {
+
+    train <- coffee_xts[1:(x - 1)] 
+    test <- coffee_xts[x:(x+11)]
+
+    model <- arima(train, order = c(arima_search[2,1],arima_search[2,2],arima_search[2,3]),
+                                    seasonal = c(arima_search[2,4],arima_search[2,5],arima_search[2,6]))
+    fcst <- forecast(model, h = 12)
+    accuracy(fcst, test)
+})
+rmse_mod2 <- mean(unlist(lapply(scores, '[[', "Test set","RMSE")))
+rmse_mod2
+```
+
+```{r}
+scores <- lapply(steps, function(x) {
+
+    train <- coffee_xts[1:(x - 1)] 
+    test <- coffee_xts[x:(x+11)]
+
+    model <- arima(train, order = c(arima_search[3,1],arima_search[3,2],arima_search[3,3]),
+                                    seasonal = c(arima_search[3,4],arima_search[3,5],arima_search[3,6]))
+    fcst <- forecast(model, h = 12)
+    accuracy(fcst, test)
+})
+rmse_mod3 <- mean(unlist(lapply(scores, '[[', "Test set","RMSE")))
+rmse_mod3
+```
+
+Looks like AIC was right and the three top models really are not much different to each other. Model 2 performs best using cross-validation and I therefore choose this one to move forward with:
+
+```{r}
+train <- window(coffee_xts,start=min(index(coffee_xts)),end=index(coffee_xts)[368])
+test <- window(coffee_xts,start=index(coffee_xts)[369],end=max(index(coffee_xts)))
+coffee_best_mod <- arima(train, order = c(arima_search[2,1],arima_search[2,2],arima_search[2,3]),
+                                    seasonal = c(arima_search[2,4],arima_search[2,5],arima_search[2,6]))
+coffee_best_mod
+```
+
+```{r}
+coffee_test_fc <- forecast(coffee_best_mod, h = 12)
+accuracy(coffee_test_fc, test)
+```
+
+Again, the RMSE using just the test set of 19.36 is significantly lower than the one using expanding window cross validation (24.36). There likely again is some overfitting/ luck going on.
+
+
+```{r}
+test_forecast(coffee_xts,
+              forecast.obj = coffee_test_fc,
+              test = test)
+```
+```{r}
+checkresiduals(coffee_best_mod)
+```
+```{r}
+plot_forecast(coffee_test_fc)
+```
+Let's see how an automatically tuned ARIMA model using auto arima compares: 
+```{r}
+coffee_auto_mod <- auto.arima(train)
+coffee_auto_mod
+```
+```{r}
+coffee_auto_fc <- forecast(coffee_auto_mod, h = 12)
+accuracy(coffee_auto_fc, test)
+```
+
+And again using expanding window cross validation:
+```{r}
+# now use those parameters to make a vector of the time steps at which each
+# window will end
+steps <- seq(from = 117, to=length(coffee_xts), by = 12)
+
+# using lapply, iterate the forecasting-and-scoring process over the
+# windows that created
+scores <- lapply(steps, function(x) {
+
+    train <- coffee_xts[1:(x - 1)] 
+    test <- coffee_xts[x:(x+11)]
+
+    model <- auto.arima(train)
+    fcst <- forecast(model, h = 12)
+    accuracy(fcst, test)
+    
+})
+rmse_auto <- mean(unlist(lapply(scores, '[[', "Test set","RMSE")))
+rmse_auto
+```
+
+
+Conclusion:
+
+```{r}
+rmse<-c(rmse_holt,rmse_hw,rmse_hw_tuned,rmse_mod1,rmse_mod2,rmse_mod3,rmse_auto)
+labels<-c("Holt","Holt-Winters","Holt-Winters Tuned","Arima Mod 1","Arima Mod 2","Arima Mod 3","Arima Auto")
+
+
+df <- data.frame(rmse,labels)
+df <- df[order(rmse),]
+df
+
+```
+Having testing a variety of different models, it appears that the simpler Holt model does the best job at predicting future data, measured by RSME. Sometimes the rule of Occam's rasor, simpler is better, really is true.
+
